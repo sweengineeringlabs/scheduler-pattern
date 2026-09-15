@@ -68,6 +68,37 @@ domains that might otherwise look similar:
 the trigger fires, from whatever thread the backend schedules it on), is
 what those two domains' shapes don't need and this one does.
 
+## Why `Job`'s double-boxing (`Arc<dyn Fn() -> BoxFuture<...>>`) is kept
+
+Raised as a zero-cost abstraction question in
+[scheduler-pattern#2](https://github.com/sweengineeringlabs/scheduler-pattern/issues/2):
+`Job` heap-allocates once for the `Arc<dyn Fn>` itself and once more for the
+`BoxFuture` each invocation returns. Checked against the actual requirement,
+not assumed either way:
+
+`Scheduler::schedule` must accept jobs of genuinely different concrete
+closure types — a caller schedules a `Once` job that sends an email, another
+schedules an `Every` job that polls a queue, a third does neither — all
+stored in the same backend's internal job table. That is heterogeneous
+storage by construction: a `Scheduler` implementation cannot know at compile
+time what concrete closure type any given `schedule` call will pass, so
+there is no monomorphizable shape for `Job` that keeps them distinct.
+`Arc<dyn Fn(...) -> BoxFuture<...>>` is the correct tool for that, not a
+shortcut — the same reason `std::thread::spawn`'s closure parameter and
+any GUI event-callback registry end up boxed too.
+
+The cost is also genuinely small at this call frequency: `schedule` runs
+once per job registered, and each job's own future is only polled once per
+`Trigger` firing (seconds-to-days apart for any real interval, not a tight
+per-message hot loop like `MessageBroker::publish` or
+`TransactionalStore::get`). Two heap allocations at that frequency are not
+worth trading away the ability to schedule arbitrary closures for.
+
+**Conclusion**: `Job`'s shape is kept as-is. `Scheduler::schedule`/`cancel`
+themselves already return `Result` directly with no boxed future at all —
+the trait's own hot-path methods were never the problem; `Job`'s boxing is
+inherent to what a job registry has to store, not a needless one.
+
 ## Why no `Validator` trait (yet)
 
 `message-broker-pattern` and `executor-pattern` both declare a `Validator`
@@ -81,7 +112,7 @@ ADR-001's own "contract-first is not unconstrained scope" principle.
 ## Scope boundary
 
 This repo covers exactly `Scheduler` (schedule/cancel time-triggered jobs).
-Not covered, deliberately:
+Not covered:
 
 - **Cron-expression triggers** — see "Why `Trigger` has only `Once`/`Every`"
   above.
